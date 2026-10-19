@@ -88,7 +88,7 @@ services:
     depends_on:
       - adminium
     ports:
-      - "8080:80"
+      - "8081:80"
       # Adminium's back office, proxied by this container's Caddy (see
       # ./Caddyfile). Upgrading an existing checkout? `docker compose up
       # --build` — this port is served by an image built from that file.
