@@ -33,12 +33,17 @@ jobs:
         github.event.workflow_run.head_repository.full_name == 'krumil76/ecommerce-storefront'
       )
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Determine source commit
+        id: source
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -53,33 +58,103 @@ jobs:
       - name: Build and push Docker image
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          docker build \
-            --tag "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}" \
-            --tag "$REGISTRY/$ECR_REPOSITORY:latest" \
-            .
-          docker push "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}"
-          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
-
-      - name: Prepare SSM deployment command
-        id: prepare
+          IMAGE_TAG: ${{ steps.source.outputs.sha }}
         shell: bash
         run: |
-          jq -n --arg sha "$GITHUB_SHA" '{
-            commands: [
-              "set -eu",
-              "aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 311937350493.dkr.ecr.us-east-2.amazonaws.com",
-              ("docker pull 311937350493.dkr.ecr.us-east-2.amazonaws.com/storefront-web:" + $sha),
-              "docker rm -f storefront-web || true",
-              ("docker run -d --name storefront-web --restart unless-stopped -p 80:80 311937350493.dkr.ecr.us-east-2.amazonaws.com/storefront-web:" + $sha),
-              "curl --fail --retry 10 --retry-delay 3 http://localhost/"
-            ]
-          }' > /tmp/ssm-commands.json
+          set -euo pipefail
+
+          IMAGE="$REGISTRY/$ECR_REPOSITORY"
+
+          docker build \
+            --tag "$IMAGE:$IMAGE_TAG" \
+            --tag "$IMAGE:latest" \
+            .
+
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:latest"
+
+      - name: Prepare SSM deployment command
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          jq -n \
+            --arg region "$AWS_REGION" \
+            --arg registry "$REGISTRY" \
+            --arg repo "$ECR_REPOSITORY" \
+            --arg tag "$IMAGE_TAG" \
+            '{
+              commands: [
+                (
+                  "set -eu\n" +
+                  "REGION=" + ($region | @sh) + "\n" +
+                  "REGISTRY=" + ($registry | @sh) + "\n" +
+                  "REPOSITORY=" + ($repo | @sh) + "\n" +
+                  "IMAGE_TAG=" + ($tag | @sh) + "\n" +
+                  "IMAGE=\"$REGISTRY/$REPOSITORY:$IMAGE_TAG\"\n" +
+
+                  "aws ecr get-login-password --region \"$REGION\" | docker login --username AWS --password-stdin \"$REGISTRY\"\n" +
+                  "docker pull \"$IMAGE\"\n" +
+
+                  "docker rm -f storefront-web-candidate >/dev/null 2>&1 || true\n" +
+                  "docker run -d --name storefront-web-candidate -p 127.0.0.1:18080:80 \"$IMAGE\"\n" +
+
+                  "candidate_ok=0\n" +
+                  "for attempt in $(seq 1 20); do\n" +
+                  "  if curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18080/ >/dev/null; then candidate_ok=1; break; fi\n" +
+                  "  sleep 3\n" +
+                  "done\n" +
+
+                  "if [ \"$candidate_ok\" -ne 1 ]; then\n" +
+                  "  docker logs storefront-web-candidate || true\n" +
+                  "  docker rm -f storefront-web-candidate || true\n" +
+                  "  echo \"Candidate health check failed; existing production container was left unchanged.\"\n" +
+                  "  exit 1\n" +
+                  "fi\n" +
+
+                  "if docker container inspect storefront-web-previous >/dev/null 2>&1; then docker rm -f storefront-web-previous; fi\n" +
+                  "if docker container inspect storefront-web >/dev/null 2>&1; then docker stop storefront-web || true; docker rename storefront-web storefront-web-previous; fi\n" +
+
+                  "if ! docker run -d --name storefront-web --restart unless-stopped -p 80:80 \"$IMAGE\"; then\n" +
+                  "  docker rm -f storefront-web || true\n" +
+                  "  if docker container inspect storefront-web-previous >/dev/null 2>&1; then docker rename storefront-web-previous storefront-web; docker start storefront-web; fi\n" +
+                  "  docker rm -f storefront-web-candidate || true\n" +
+                  "  exit 1\n" +
+                  "fi\n" +
+
+                  "production_ok=0\n" +
+                  "for attempt in $(seq 1 20); do\n" +
+                  "  if curl --fail --silent --show-error --max-time 5 http://127.0.0.1/ >/dev/null; then production_ok=1; break; fi\n" +
+                  "  sleep 3\n" +
+                  "done\n" +
+
+                  "if [ \"$production_ok\" -ne 1 ]; then\n" +
+                  "  docker logs storefront-web || true\n" +
+                  "  docker rm -f storefront-web || true\n" +
+                  "  if docker container inspect storefront-web-previous >/dev/null 2>&1; then docker rename storefront-web-previous storefront-web; docker start storefront-web; fi\n" +
+                  "  docker rm -f storefront-web-candidate || true\n" +
+                  "  echo \"Production health check failed; rollback attempted.\"\n" +
+                  "  exit 1\n" +
+                  "fi\n" +
+
+                  "docker rm -f storefront-web-candidate >/dev/null 2>&1 || true\n" +
+                  "docker rm -f storefront-web-previous >/dev/null 2>&1 || true\n" +
+                  "echo \"Deployment and HTTP health check succeeded.\"\n"
+                )
+              ]
+            }' > /tmp/ssm-commands.json
+
+          jq -e '.commands | length == 1' /tmp/ssm-commands.json >/dev/null
 
       - name: Deploy through AWS Systems Manager
         id: deploy
         shell: bash
         run: |
+          set -euo pipefail
+
           COMMAND_ID=$(aws ssm send-command \
             --document-name AWS-RunShellScript \
             --targets "Key=tag:aws:autoscaling:groupName,Values=storefront-dev-asg" \
@@ -96,31 +171,62 @@ jobs:
           COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
         shell: bash
         run: |
-          for attempt in $(seq 1 30); do
-            STATUS=$(aws ssm list-command-invocations \
+          set -euo pipefail
+
+          for attempt in $(seq 1 36); do
+            INVOCATIONS=$(aws ssm list-command-invocations \
               --command-id "$COMMAND_ID" \
               --details \
-              --query 'CommandInvocations[0].Status' \
-              --output text \
-              --region "$AWS_REGION")
+              --region "$AWS_REGION" \
+              --output json)
 
-            echo "Deployment status: $STATUS"
+            TOTAL=$(jq '.CommandInvocations | length' <<< "$INVOCATIONS")
 
-            case "$STATUS" in
-              Success)
-                exit 0
-                ;;
-              Failed|Cancelled|TimedOut|Cancelling)
-                aws ssm list-command-invocations \
-                  --command-id "$COMMAND_ID" \
-                  --details \
-                  --region "$AWS_REGION"
-                exit 1
-                ;;
-            esac
+            SUCCEEDED=$(jq \
+              '[.CommandInvocations[] | select(.Status == "Success")] | length' \
+              <<< "$INVOCATIONS")
+
+            FAILED=$(jq \
+              '[.CommandInvocations[] | select(
+                .Status == "Failed" or
+                .Status == "Cancelled" or
+                .Status == "TimedOut" or
+                .Status == "Cancelling" or
+                .Status == "DeliveryTimedOut" or
+                .Status == "ExecutionTimedOut" or
+                .Status == "Undeliverable" or
+                .Status == "Terminated" or
+                .Status == "InvalidPlatform" or
+                .Status == "AccessDenied"
+              )] | length' \
+              <<< "$INVOCATIONS")
+
+            echo "Instances: total=$TOTAL succeeded=$SUCCEEDED failed=$FAILED"
+
+            if [ "$FAILED" -gt 0 ]; then
+              jq '.CommandInvocations[] | select(
+                .Status != "Success"
+              ) | {
+                InstanceId,
+                Status,
+                StatusDetails,
+                StandardOutputContent,
+                StandardErrorContent
+              }' <<< "$INVOCATIONS"
+              exit 1
+            fi
+
+            if [ "$TOTAL" -gt 0 ] && [ "$SUCCEEDED" -eq "$TOTAL" ]; then
+              echo "Deployment succeeded on all targeted instances."
+              exit 0
+            fi
 
             sleep 10
           done
 
-          echo "Timed out waiting for SSM deployment result."
+          echo "Timed out waiting for deployment."
+          aws ssm list-command-invocations \
+            --command-id "$COMMAND_ID" \
+            --details \
+            --region "$AWS_REGION"
           exit 1
