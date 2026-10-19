@@ -1,0 +1,126 @@
+name: Deploy Storefront
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: storefront-web
+  AWS_ACCOUNT_ID: "311937350493"
+
+jobs:
+  deploy:
+    name: Build, Push and Deploy
+    if: >-
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main'
+      ) ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == 'krumil76/ecommerce-storefront'
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::311937350493:role/github-actions-ecommerce-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build \
+            --tag "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}" \
+            --tag "$REGISTRY/$ECR_REPOSITORY:latest" \
+            .
+          docker push "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Prepare SSM deployment command
+        id: prepare
+        shell: bash
+        run: |
+          jq -n --arg sha "$GITHUB_SHA" '{
+            commands: [
+              "set -eu",
+              "aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 311937350493.dkr.ecr.us-east-2.amazonaws.com",
+              ("docker pull 311937350493.dkr.ecr.us-east-2.amazonaws.com/storefront-web:" + $sha),
+              "docker rm -f storefront-web || true",
+              ("docker run -d --name storefront-web --restart unless-stopped -p 80:80 311937350493.dkr.ecr.us-east-2.amazonaws.com/storefront-web:" + $sha),
+              "curl --fail --retry 10 --retry-delay 3 http://localhost/"
+            ]
+          }' > /tmp/ssm-commands.json
+
+      - name: Deploy through AWS Systems Manager
+        id: deploy
+        shell: bash
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=storefront-dev-asg" \
+            --parameters file:///tmp/ssm-commands.json \
+            --region "$AWS_REGION" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command ID: $COMMAND_ID"
+
+      - name: Wait for deployment result
+        env:
+          COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
+        shell: bash
+        run: |
+          for attempt in $(seq 1 30); do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$COMMAND_ID" \
+              --details \
+              --query 'CommandInvocations[0].Status' \
+              --output text \
+              --region "$AWS_REGION")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm list-command-invocations \
+                  --command-id "$COMMAND_ID" \
+                  --details \
+                  --region "$AWS_REGION"
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "Timed out waiting for SSM deployment result."
+          exit 1

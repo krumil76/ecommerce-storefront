@@ -18,3 +18,6 @@ dist
 *.tfplan
 crash.log
 crash.*.log
+
+# Local AWS IAM policy drafts and backups
+.github/iam/
