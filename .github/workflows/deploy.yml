@@ -1,232 +1,92 @@
-name: Deploy Storefront
+name: ci
 
 on:
-  workflow_run:
-    workflows: ["ci"]
-    types:
-      - completed
-    branches:
-      - main
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write
-
-concurrency:
-  group: storefront-deploy
-  cancel-in-progress: false
-
-env:
-  AWS_REGION: us-east-2
-  AWS_ACCOUNT_ID: "311937350493"
-  ECR_REPOSITORY: storefront-web
-
 jobs:
-  deploy:
-    name: Build, Push and Deploy
-    if: >-
-      (
-        github.event_name == 'workflow_dispatch' &&
-        github.ref == 'refs/heads/main'
-      ) ||
-      (
-        github.event_name == 'workflow_run' &&
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        github.event.workflow_run.head_repository.full_name == 'krumil76/ecommerce-storefront'
-      )
+  build:
+    name: build & test
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout source
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Does this repo load the product's validator?
+        id: needs_product
+        shell: bash
+        run: |
+          if grep -rq "ADMINIUM_REPO" src 2>/dev/null; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Does this repo check its pages against its tables?
+        id: checks_pages
+        shell: bash
+        run: |
+          if [ -f src/manifest-pages.test.ts ]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the Adminium product
+        if: steps.needs_product.outputs.value == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          repository: MoSofi/Adminium
+          path: .adminium-product
 
-      - name: Determine source commit
-        id: source
-        shell: bash
-        run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-ecommerce-deploy
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push Docker image
+      - name: Build the product's validator and move it out of the workspace
+        if: steps.needs_product.outputs.value == 'true'
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ steps.source.outputs.sha }}
+          CHECKS_PAGES: ${{ steps.checks_pages.outputs.value }}
         shell: bash
         run: |
           set -euo pipefail
-          IMAGE="${REGISTRY}/${ECR_REPOSITORY}"
+          cd "$GITHUB_WORKSPACE/.adminium-product"
+          corepack enable
 
-          docker build \
-            --tag "${IMAGE}:${IMAGE_TAG}" \
-            --tag "${IMAGE}:latest" \
-            .
+          if [ "$CHECKS_PAGES" = "true" ]; then
+            pnpm install --frozen-lockfile --filter "@adminium/manifest..." --filter "@adminium/engine..."
+            pnpm --filter "@adminium/manifest..." --filter "@adminium/engine..." build
+          else
+            pnpm install --frozen-lockfile --filter "@adminium/manifest..."
+            pnpm --filter "@adminium/manifest..." build
+          fi
 
-          docker push "${IMAGE}:${IMAGE_TAG}"
-          docker push "${IMAGE}:latest"
+          mv "$GITHUB_WORKSPACE/.adminium-product" "$RUNNER_TEMP/adminium-product"
 
-      - name: Create SSM deployment script
+      - name: Test
         env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ steps.source.outputs.sha }}
+          ADMINIUM_REPO: ${{ steps.needs_product.outputs.value == 'true' && format('{0}/adminium-product', runner.temp) || '' }}
+          ADMINIUM_REQUIRE_VALIDATOR: ${{ steps.needs_product.outputs.value }}
+        run: npm test
+
+      - name: Manifest checks
         shell: bash
         run: |
-          set -euo pipefail
-
-          cat > /tmp/deploy-storefront.sh <<'EOF'
-          set -euxo pipefail
-
-          REGION="${AWS_REGION}"
-          REGISTRY="${REGISTRY}"
-          REPOSITORY="${ECR_REPOSITORY}"
-          IMAGE_TAG="${IMAGE_TAG}"
-          IMAGE="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
-
-          aws ecr get-login-password --region "${REGION}" | docker login --username AWS --password-stdin "${REGISTRY}"
-
-          docker pull "${IMAGE}"
-
-          docker rm -f storefront-web-candidate >/dev/null 2>&1 || true
-          docker run -d --name storefront-web-candidate -p 127.0.0.1:18080:80 "${IMAGE}"
-
-          candidate_ok=0
-          for attempt in $(seq 1 20); do
-            if curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18080/ >/dev/null; then
-              candidate_ok=1
-              break
-            fi
-            sleep 3
-          done
-
-          if [ "${candidate_ok}" -ne 1 ]; then
-            docker logs storefront-web-candidate || true
-            docker rm -f storefront-web-candidate || true
-            echo "Candidate health check failed; existing production container was left unchanged."
-            exit 1
+          if [ -f manifest.test.mjs ]; then
+            node --test manifest.test.mjs
+          else
+            echo "no manifest.test.mjs in this repo — skipping"
           fi
-
-          if docker container inspect storefront-web-previous >/dev/null 2>&1; then
-            docker rm -f storefront-web-previous
-          fi
-
-          if docker container inspect storefront-web >/dev/null 2>&1; then
-            docker stop storefront-web || true
-            docker rename storefront-web storefront-web-previous
-          fi
-
-          if ! docker run -d --name storefront-web --restart unless-stopped -p 80:80 "${IMAGE}"; then
-            docker rm -f storefront-web || true
-            if docker container inspect storefront-web-previous >/dev/null 2>&1; then
-              docker rename storefront-web-previous storefront-web
-              docker start storefront-web
-            fi
-            docker rm -f storefront-web-candidate || true
-            echo "Production container start failed; rollback attempted."
-            exit 1
-          fi
-
-          production_ok=0
-          for attempt in $(seq 1 20); do
-            if curl --fail --silent --show-error --max-time 5 http://127.0.0.1/ >/dev/null; then
-              production_ok=1
-              break
-            fi
-            sleep 3
-          done
-
-          if [ "${production_ok}" -ne 1 ]; then
-            docker logs storefront-web || true
-            docker rm -f storefront-web || true
-            if docker container inspect storefront-web-previous >/dev/null 2>&1; then
-              docker rename storefront-web-previous storefront-web
-              docker start storefront-web
-            fi
-            docker rm -f storefront-web-candidate || true
-            echo "Production health check failed; rollback attempted."
-            exit 1
-          fi
-
-          docker rm -f storefront-web-candidate >/dev/null 2>&1 || true
-          docker rm -f storefront-web-previous >/dev/null 2>&1 || true
-          echo "Deployment and HTTP health check succeeded."
-          EOF
-
-          chmod +x /tmp/deploy-storefront.sh
-
-          jq -n \
-            --arg script "$(cat /tmp/deploy-storefront.sh)" \
-            '{
-              commands: [$script]
-            }' > /tmp/ssm-commands.json
-
-          jq -e '.commands | length == 1' /tmp/ssm-commands.json >/dev/null
-
-      - name: Deploy through AWS Systems Manager
-        id: deploy
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          COMMAND_ID="$(aws ssm send-command \
-            --document-name AWS-RunShellScript \
-            --targets "Key=tag:aws:autoscaling:groupName,Values=storefront-dev-asg" \
-            --parameters file:///tmp/ssm-commands.json \
-            --region "${AWS_REGION}" \
-            --query 'Command.CommandId' \
-            --output text)"
-
-          echo "command_id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
-          echo "SSM command ID: ${COMMAND_ID}"
-
-      - name: Wait for deployment result
-        shell: bash
-        env:
-          COMMAND_ID: ${{ steps.deploy.outputs.command_id }}
-        run: |
-          set -euo pipefail
-
-          for attempt in $(seq 1 36); do
-            INVOCATIONS="$(aws ssm list-command-invocations \
-              --command-id "${COMMAND_ID}" \
-              --details \
-              --region "${AWS_REGION}" \
-              --output json)"
-
-            TOTAL="$(jq '.CommandInvocations | length // 0' <<< "${INVOCATIONS}")"
-            SUCCEEDED="$(jq '[.CommandInvocations[]? | select(.Status == "Success")] | length' <<< "${INVOCATIONS}")"
-            FAILED="$(jq '[.CommandInvocations[]? | select(.Status != "Success")] | length' <<< "${INVOCATIONS}")"
-
-            echo "Instances: total=${TOTAL} succeeded=${SUCCEEDED} failed=${FAILED}"
-
-            if [ "${FAILED}" -gt 0 ]; then
-              jq '.CommandInvocations[]? | select(.Status != "Success") | {InstanceId, Status, StatusDetails, StandardOutputContent, StandardErrorContent}' <<< "${INVOCATIONS}"
-              exit 1
-            fi
-
-            if [ "${TOTAL}" -gt 0 ] && [ "${SUCCEEDED}" -eq "${TOTAL}" ]; then
-              echo "Deployment succeeded on all targeted instances."
-              exit 0
-            fi
-
-            sleep 10
-          done
-
-          echo "Timed out waiting for deployment."
-          aws ssm list-command-invocations \
-            --command-id "${COMMAND_ID}" \
-            --details \
-            --region "${AWS_REGION}"
-          exit 1
