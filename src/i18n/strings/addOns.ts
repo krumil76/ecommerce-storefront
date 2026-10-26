@@ -73,7 +73,6 @@ export const addOns = {
     'addon.host.notAffiliated':
       'Adminium is not affiliated with the companies these add-ons connect to. Every name and mark belongs to its owner.',
   },
-
   'de-DE': {
     'addon.host.checkout.slotTitle': 'Weitere Versandwege',
     'addon.host.checkout.slotEmpty':

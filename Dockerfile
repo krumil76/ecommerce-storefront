@@ -17,9 +17,8 @@ COPY . .
 # only read what its scope lists, and it is refused everywhere outside
 # /api/v1/public. A secret `adm_sk_` key here would be a real leak.
 ARG VITE_ADMINIUM_API_BASE_URL=""
-ARG VITE_ADMINIUM_PUBLISHABLE_KEY=""
 ENV VITE_ADMINIUM_API_BASE_URL=$VITE_ADMINIUM_API_BASE_URL
-ENV VITE_ADMINIUM_PUBLISHABLE_KEY=$VITE_ADMINIUM_PUBLISHABLE_KEY
+
 
 RUN npm run build
 

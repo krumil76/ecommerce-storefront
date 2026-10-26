@@ -94,7 +94,8 @@ resource "aws_route_table_association" "public_b" {
   subnet_id      = aws_subnet.public_b.id
   route_table_id = aws_route_table.public.id
 }
-# ALB Security Group
+
+# ALB Security Group: HTTP and HTTPS
 resource "aws_security_group" "alb" {
   name        = "storefront-dev-alb-sg"
   description = "Allow public HTTP traffic to ALB"
@@ -104,6 +105,14 @@ resource "aws_security_group" "alb" {
     description = "HTTP from the internet"
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "HTTPS from the internet"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -145,6 +154,7 @@ resource "aws_security_group" "ec2" {
     Name = "storefront-dev-ec2-sg"
   })
 }
+
 # EC2 IAM Role
 resource "aws_iam_role" "ec2" {
   name = "storefront-dev-ec2-role"
@@ -182,6 +192,7 @@ resource "aws_iam_instance_profile" "ec2" {
 
   tags = local.common_tags
 }
+
 # EC2 Launch Template
 resource "aws_launch_template" "web" {
   name_prefix   = "storefront-dev-"
@@ -230,6 +241,7 @@ resource "aws_launch_template" "web" {
     Name = "storefront-dev-launch-template"
   })
 }
+
 # Application Target Group
 resource "aws_lb_target_group" "web" {
   name        = "storefront-dev-tg"
@@ -254,12 +266,14 @@ resource "aws_lb_target_group" "web" {
     Name = "storefront-dev-tg"
   })
 }
+
 # Auto Scaling Group
 resource "aws_autoscaling_group" "web" {
   name             = "storefront-dev-asg"
   min_size         = 1
   desired_capacity = 1
   max_size         = 2
+
   vpc_zone_identifier = [
     aws_subnet.public_a.id,
     aws_subnet.public_b.id
@@ -293,6 +307,7 @@ resource "aws_autoscaling_group" "web" {
     }
   }
 }
+
 # Application Load Balancer
 resource "aws_lb" "web" {
   name               = "storefront-dev-alb"
@@ -310,17 +325,38 @@ resource "aws_lb" "web" {
   })
 }
 
-# HTTP Listener
+# HTTP Listener: redirect all HTTP requests to HTTPS
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.web.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+# HTTPS Listener: use the issued ACM certificate
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.web.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+
+  certificate_arn = "arn:aws:acm:us-east-2:311937350493:certificate/d2b2bee2-1f1f-4c56-8645-6aaa461a7f4b"
+
+  default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.web.arn
   }
 }
+
 # Useful deployment outputs
 output "vpc_id" {
   description = "ID of the storefront VPC"
@@ -333,8 +369,8 @@ output "alb_dns_name" {
 }
 
 output "website_url" {
-  description = "Public HTTP URL of the storefront"
-  value       = "http://${aws_lb.web.dns_name}"
+  description = "HTTPS URL of the storefront ALB"
+  value       = "https://facetlab.alyrajewel.com"
 }
 
 output "target_group_arn" {
@@ -346,3 +382,6 @@ output "autoscaling_group_name" {
   description = "Name of the storefront Auto Scaling Group"
   value       = aws_autoscaling_group.web.name
 }
+
+
+
